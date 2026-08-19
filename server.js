@@ -105,9 +105,12 @@ function bool(value, fallback = false) {
 
 function imageUrl(req, file) {
   if (!file) return null;
-  return `${req.protocol}://${req.get("host")}/uploads/${encodeURIComponent(
-    file
-  )}`;
+
+  const forwardedProtocol = req.get("x-forwarded-proto")?.split(",")[0];
+  const protocol = forwardedProtocol || req.protocol;
+  const origin = process.env.PUBLIC_API_ORIGIN || `${protocol}://${req.get("host")}`;
+
+  return `${origin.replace(/\/$/, "")}/uploads/${encodeURIComponent(file)}`;
 }
 
 function serialize(req, product) {
