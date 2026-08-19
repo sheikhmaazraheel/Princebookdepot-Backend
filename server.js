@@ -11,6 +11,7 @@ const fs = require("fs/promises");
 const Product = require("./models/Product");
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT) || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || true;
