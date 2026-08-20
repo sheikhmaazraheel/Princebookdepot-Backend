@@ -430,7 +430,7 @@ app.get(
     try {
       const filter = {};
       const requestedStatus = String(req.query.status || "").trim().toLowerCase();
-      const validStatuses = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled"];
+      const validStatuses = ["pending", "confirmed", "processing", "shipped", "delivered", "completed", "cancelled", "returned"];
 
       if (requestedStatus && validStatuses.includes(requestedStatus)) {
         filter.status = requestedStatus;
@@ -450,6 +450,53 @@ app.get(
         success: true,
         count: orders.length,
         orders,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ============================================================
+// UPDATE ORDER STATUS
+// ============================================================
+
+app.patch(
+  "/api/orders/:orderId/status",
+  async (req, res, next) => {
+    try {
+      const status = String(req.body?.status || "").trim().toLowerCase();
+      const validStatuses = ["pending", "confirmed", "processing", "shipped", "delivered", "completed", "cancelled", "returned"];
+
+      if (!validStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid order status.",
+        });
+      }
+
+      const order = await Order.findOneAndUpdate(
+        { orderId: String(req.params.orderId || "").trim() },
+        { $set: { status, statusUpdatedAt: new Date() } },
+        { new: true, runValidators: true }
+      ).lean();
+
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found.",
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "Order status updated.",
+        order: {
+          orderId: order.orderId,
+          status: order.status,
+          statusUpdatedAt: order.statusUpdatedAt,
+        },
       });
     } catch (error) {
       next(error);
