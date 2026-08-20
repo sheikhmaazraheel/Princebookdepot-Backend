@@ -4,6 +4,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const helmet = require("helmet");
+const crypto = require("crypto");
+const { promisify } = require("util");
 const cloudinary = require("cloudinary").v2;
 
 const Product = require("./models/Product");
@@ -23,6 +25,12 @@ const FRONTEND_ORIGIN =
 
 const MAX_IMAGE_MB =
   Number(process.env.MAX_IMAGE_MB) || 5;
+
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+const AUTH_SECRET = process.env.AUTH_SECRET;
+const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
+const scryptAsync = promisify(crypto.scrypt);
 
 
 // ============================================================
@@ -46,6 +54,11 @@ if (!process.env.CLOUDINARY_API_KEY) {
 
 if (!process.env.CLOUDINARY_API_SECRET) {
   console.error("❌ CLOUDINARY_API_SECRET is missing");
+  process.exit(1);
+}
+
+if (!ADMIN_USERNAME || !ADMIN_PASSWORD_HASH || !AUTH_SECRET) {
+  console.error("❌ ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and AUTH_SECRET are required");
   process.exit(1);
 }
 
@@ -83,6 +96,7 @@ app.use(
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
+    credentials: true,
 
     methods: [
       "GET",
@@ -356,6 +370,59 @@ function escapeRegex(
   );
 }
 
+function parseCookies(request) {
+  return Object.fromEntries(
+    String(request.headers.cookie || "")
+      .split(";")
+      .filter(Boolean)
+      .map((part) => {
+        const separator = part.indexOf("=");
+        return [part.slice(0, separator).trim(), decodeURIComponent(part.slice(separator + 1).trim())];
+      })
+  );
+}
+
+function signSession(payload) {
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", AUTH_SECRET).update(encodedPayload).digest("base64url");
+  return `${encodedPayload}.${signature}`;
+}
+
+function verifySession(token) {
+  if (!token) return null;
+  const [encodedPayload, signature] = token.split(".");
+  if (!encodedPayload || !signature) return null;
+  const expectedSignature = crypto.createHmac("sha256", AUTH_SECRET).update(encodedPayload).digest("base64url");
+  const providedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    return payload.exp > Date.now() ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyPassword(password) {
+  const [algorithm, salt, storedKey] = String(ADMIN_PASSWORD_HASH).split("$");
+  if (algorithm !== "scrypt" || !salt || !storedKey) return false;
+  const derivedKey = await scryptAsync(String(password || ""), salt, 64);
+  const expectedKey = Buffer.from(storedKey, "hex");
+  return expectedKey.length === derivedKey.length && crypto.timingSafeEqual(expectedKey, derivedKey);
+}
+
+function requireAdmin(request, response, next) {
+  const session = verifySession(parseCookies(request).pbd_admin_session);
+  if (!session) return response.status(401).json({ success: false, message: "Admin authentication required." });
+  request.admin = session;
+  next();
+}
+
+function setSessionCookie(response, token) {
+  response.setHeader("Set-Cookie", `pbd_admin_session=${encodeURIComponent(token)}; Max-Age=3600; Path=/; HttpOnly; Secure; SameSite=None`);
+}
+
 const DELIVERY_CHARGES = Object.freeze({
   central: 150,
   south: 180,
@@ -384,6 +451,49 @@ function requireText(value, label, maxLength) {
 // ============================================================
 // ROOT
 // ============================================================
+
+app.post(
+  "/api/auth/login",
+  async (req, res, next) => {
+    try {
+      const username = String(req.body?.username || "").trim();
+      const password = String(req.body?.password || "");
+      const usernameMatches = username === ADMIN_USERNAME;
+      const passwordMatches = await verifyPassword(password);
+
+      if (!usernameMatches || !passwordMatches) {
+        return res.status(401).json({ success: false, message: "Invalid username or password." });
+      }
+
+      const token = signSession({
+        username: ADMIN_USERNAME,
+        iat: Date.now(),
+        exp: Date.now() + SESSION_MAX_AGE_MS,
+      });
+      setSessionCookie(res, token);
+      res.json({ success: true, expiresAt: Date.now() + SESSION_MAX_AGE_MS });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.get(
+  "/api/auth/session",
+  (req, res) => {
+    const session = verifySession(parseCookies(req).pbd_admin_session);
+    if (!session) return res.status(401).json({ success: false, authenticated: false });
+    res.json({ success: true, authenticated: true, username: session.username, expiresAt: session.exp });
+  }
+);
+
+app.post(
+  "/api/auth/logout",
+  (_req, res) => {
+    res.setHeader("Set-Cookie", "pbd_admin_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=None");
+    res.json({ success: true });
+  }
+);
 
 app.get(
   "/",
@@ -427,6 +537,7 @@ app.get(
 
 app.get(
   "/api/orders",
+  requireAdmin,
   async (req, res, next) => {
     try {
       const filter = {};
@@ -465,6 +576,7 @@ app.get(
 
 app.patch(
   "/api/orders/:orderId/status",
+  requireAdmin,
   async (req, res, next) => {
     try {
       const status = String(req.body?.status || "").trim().toLowerCase();
@@ -845,6 +957,7 @@ app.get(
 
 app.post(
   "/api/products",
+  requireAdmin,
   async (req, res, next) => {
 
     let uploadedAsset =
@@ -1019,6 +1132,7 @@ app.post(
 
 app.put(
   "/api/products/:id",
+  requireAdmin,
   async (req, res, next) => {
 
     let newCloudinaryAsset =
@@ -1224,6 +1338,7 @@ app.put(
 
 app.delete(
   "/api/products/:id",
+  requireAdmin,
   async (req, res, next) => {
 
     try {
