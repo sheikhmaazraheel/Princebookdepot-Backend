@@ -31,6 +31,15 @@ const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
 const AUTH_SECRET = process.env.AUTH_SECRET;
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
 const scryptAsync = promisify(crypto.scrypt);
+const WHATSAPP_API_VERSION = process.env.WHATSAPP_API_VERSION || "v25.0";
+const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET;
+const WHATSAPP_CONFIRMATION_TEMPLATE = process.env.WHATSAPP_CONFIRMATION_TEMPLATE;
+const WHATSAPP_TEMPLATE_LANGUAGE = process.env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US";
+const WHATSAPP_ADMIN_PHONE = process.env.WHATSAPP_ADMIN_PHONE;
+const WHATSAPP_ADMIN_ALERT_TEMPLATE = process.env.WHATSAPP_ADMIN_ALERT_TEMPLATE;
 
 
 // ============================================================
@@ -123,6 +132,9 @@ const JSON_LIMIT_MB =
 app.use(
   express.json({
     limit: `${JSON_LIMIT_MB}mb`,
+    verify: (request, _response, buffer) => {
+      request.rawBody = buffer;
+    },
   })
 );
 
@@ -447,10 +459,171 @@ function requireText(value, label, maxLength) {
   return text;
 }
 
+function isWhatsAppConfigured() {
+  return Boolean(
+    WHATSAPP_ACCESS_TOKEN &&
+      WHATSAPP_PHONE_NUMBER_ID &&
+      WHATSAPP_CONFIRMATION_TEMPLATE &&
+    WHATSAPP_VERIFY_TOKEN &&
+    WHATSAPP_APP_SECRET
+  );
+}
+
+function normalizeWhatsAppNumber(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.startsWith("00")) return digits.slice(2);
+  if (digits.startsWith("0")) return `92${digits.slice(1)}`;
+  if (digits.startsWith("92")) return digits;
+  if (digits.length === 10 && digits.startsWith("3")) return `92${digits}`;
+  return digits;
+}
+
+async function sendWhatsAppMessage(to, payload) {
+  const response = await fetch(
+    `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ messaging_product: "whatsapp", recipient_type: "individual", to, ...payload }),
+    }
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message || `WhatsApp API returned ${response.status}.`);
+  return data;
+}
+
+function orderTemplateParameters(order) {
+  return [
+    { type: "text", text: order.customer.name },
+    { type: "text", text: order.orderId },
+    { type: "text", text: `Rs.${order.pricing.total.toLocaleString("en-PK")}` },
+  ];
+}
+
+async function sendOrderConfirmationRequest(order) {
+  if (!isWhatsAppConfigured()) return { sent: false, reason: "WhatsApp is not configured." };
+
+  const customerWaId = normalizeWhatsAppNumber(order.customer.contact);
+  if (!customerWaId || customerWaId.length < 10) return { sent: false, reason: "Customer phone number is invalid." };
+
+  const data = await sendWhatsAppMessage(customerWaId, {
+    type: "template",
+    template: {
+      name: WHATSAPP_CONFIRMATION_TEMPLATE,
+      language: { code: WHATSAPP_TEMPLATE_LANGUAGE },
+      components: [
+        { type: "body", parameters: orderTemplateParameters(order) },
+        { type: "button", sub_type: "quick_reply", index: "0", parameters: [{ type: "payload", payload: `CONFIRM_ORDER:${order.orderId}` }] },
+        { type: "button", sub_type: "quick_reply", index: "1", parameters: [{ type: "payload", payload: `CANCEL_ORDER:${order.orderId}` }] },
+      ],
+    },
+  });
+
+  await Order.updateOne(
+    { _id: order._id },
+    {
+      $set: {
+        "whatsapp.customerWaId": customerWaId,
+        "whatsapp.confirmationStatus": "pending",
+        "whatsapp.confirmationMessageId": data.messages?.[0]?.id,
+        "whatsapp.confirmationSentAt": new Date(),
+        "whatsapp.lastError": undefined,
+      },
+    }
+  );
+  return { sent: true, messageId: data.messages?.[0]?.id };
+}
+
+async function sendAdminConfirmationAlert(order, action) {
+  if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ADMIN_PHONE) return;
+  const message = `Order ${order.orderId} is ${action} by ${order.customer.name}. Total: Rs.${order.pricing.total.toLocaleString("en-PK")}. Check the admin dashboard.`;
+
+  if (WHATSAPP_ADMIN_ALERT_TEMPLATE) {
+    await sendWhatsAppMessage(normalizeWhatsAppNumber(WHATSAPP_ADMIN_PHONE), {
+      type: "template",
+      template: {
+        name: WHATSAPP_ADMIN_ALERT_TEMPLATE,
+        language: { code: WHATSAPP_TEMPLATE_LANGUAGE },
+        components: [
+          { type: "body", parameters: [{ type: "text", text: order.orderId }, { type: "text", text: action }, { type: "text", text: order.customer.name }, { type: "text", text: `Rs.${order.pricing.total.toLocaleString("en-PK")}` }] },
+        ],
+      },
+    });
+    return;
+  }
+
+  await sendWhatsAppMessage(normalizeWhatsAppNumber(WHATSAPP_ADMIN_PHONE), { type: "text", text: { preview_url: false, body: message } });
+}
+
+async function handleWhatsAppConfirmation(payload) {
+  const messages = payload.entry?.flatMap((entry) => entry.changes || [])
+    .flatMap((change) => change.value?.messages || []) || [];
+
+  for (const message of messages) {
+    if (message.type !== "interactive" || message.interactive?.type !== "button_reply") continue;
+    const buttonPayload = String(message.interactive.button_reply.id || message.interactive.button_reply.title || "");
+    const match = buttonPayload.match(/^(CONFIRM_ORDER|CANCEL_ORDER):(.+)$/);
+    if (!match) continue;
+
+    const [, action, orderId] = match;
+    const order = await Order.findOne({ orderId });
+    if (!order || order.whatsapp?.customerWaId !== message.from) continue;
+    if (!["pending", "confirmed"].includes(order.status) && action === "CONFIRM_ORDER") continue;
+
+    const confirmed = action === "CONFIRM_ORDER";
+    if (order.whatsapp?.confirmationStatus === (confirmed ? "confirmed" : "cancelled")) continue;
+    const nextStatus = confirmed ? "confirmed" : "cancelled";
+    const now = new Date();
+    order.status = nextStatus;
+    order.statusUpdatedAt = now;
+    order.whatsapp.confirmationStatus = confirmed ? "confirmed" : "cancelled";
+    if (confirmed) order.whatsapp.confirmedAt = now;
+    else order.whatsapp.cancelledAt = now;
+    await order.save();
+
+    await sendWhatsAppMessage(message.from, {
+      type: "text",
+      text: { preview_url: false, body: confirmed ? `Thank you. Order ${order.orderId} is confirmed. We will prepare it for delivery.` : `Order ${order.orderId} has been cancelled as requested.` },
+    }).catch((error) => console.error("WhatsApp customer acknowledgement failed:", error.message));
+    if (confirmed) await sendAdminConfirmationAlert(order, "confirmed").catch((error) => console.error("WhatsApp admin alert failed:", error.message));
+  }
+}
+
 
 // ============================================================
 // ROOT
 // ============================================================
+
+app.get(
+  "/api/whatsapp/webhook",
+  (req, res) => {
+    if (!WHATSAPP_VERIFY_TOKEN || req.query["hub.verify_token"] !== WHATSAPP_VERIFY_TOKEN) {
+      return res.sendStatus(403);
+    }
+    res.status(200).send(req.query["hub.challenge"]);
+  }
+);
+
+app.post(
+  "/api/whatsapp/webhook",
+  (req, res) => {
+    if (WHATSAPP_APP_SECRET) {
+      const signature = String(req.headers["x-hub-signature-256"] || "");
+      const expected = `sha256=${crypto.createHmac("sha256", WHATSAPP_APP_SECRET).update(req.rawBody || "").digest("hex")}`;
+      const providedBuffer = Buffer.from(signature);
+      const expectedBuffer = Buffer.from(expected);
+      if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
+        return res.sendStatus(401);
+      }
+    }
+
+    res.sendStatus(200);
+    handleWhatsAppConfirmation(req.body).catch((error) => console.error("WhatsApp webhook processing failed:", error));
+  }
+);
 
 app.post(
   "/api/auth/login",
@@ -731,6 +904,18 @@ app.post(
         location,
       });
 
+      let whatsapp = { sent: false, reason: "WhatsApp is not configured." };
+      try {
+        whatsapp = await sendOrderConfirmationRequest(order);
+      } catch (error) {
+        console.error("WhatsApp order confirmation failed:", error.message);
+        await Order.updateOne(
+          { _id: order._id },
+          { $set: { "whatsapp.confirmationStatus": "not_sent", "whatsapp.lastError": error.message.slice(0, 500) } }
+        );
+        whatsapp = { sent: false, reason: "Order saved, but WhatsApp confirmation could not be sent." };
+      }
+
       res.status(201).json({
         success: true,
         message: "Order received successfully.",
@@ -740,6 +925,7 @@ app.post(
           pricing: order.pricing,
           locationCaptured: Boolean(order.location?.latitude !== undefined),
           createdAt: order.createdAt,
+          whatsapp,
         },
       });
     } catch (error) {

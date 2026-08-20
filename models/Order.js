@@ -89,6 +89,19 @@ const orderSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    whatsapp: {
+      customerWaId: { type: String, trim: true },
+      confirmationStatus: {
+        type: String,
+        enum: ["not_sent", "pending", "confirmed", "cancelled"],
+        default: "not_sent",
+      },
+      confirmationMessageId: { type: String, trim: true },
+      confirmationSentAt: { type: Date },
+      confirmedAt: { type: Date },
+      cancelledAt: { type: Date },
+      lastError: { type: String, maxlength: 500 },
+    },
   },
   {
     timestamps: true,
