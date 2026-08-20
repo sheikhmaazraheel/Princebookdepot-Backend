@@ -7,6 +7,7 @@ const helmet = require("helmet");
 const cloudinary = require("cloudinary").v2;
 
 const Product = require("./models/Product");
+const Order = require("./models/Order");
 
 const app = express();
 
@@ -354,6 +355,30 @@ function escapeRegex(
   );
 }
 
+const DELIVERY_CHARGES = Object.freeze({
+  central: 150,
+  south: 180,
+  east: 200,
+  west: 220,
+  malir: 250,
+  outside: 300,
+});
+
+function createOrderId() {
+  const timestamp = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  const random = Math.floor(100 + Math.random() * 900);
+  return `PBD-${pad(timestamp.getDate())}${pad(timestamp.getMonth() + 1)}${timestamp.getFullYear()}-${timestamp.getTime()}-${random}`;
+}
+
+function requireText(value, label, maxLength) {
+  const text = String(value || "").trim();
+  if (!text || text.length > maxLength) {
+    throw new Error(`${label} is required and must be ${maxLength} characters or fewer.`);
+  }
+  return text;
+}
+
 
 // ============================================================
 // ROOT
@@ -391,6 +416,137 @@ app.get(
       cloudinary:
         "configured",
     });
+  }
+);
+
+
+// ============================================================
+// CREATE ORDER
+// ============================================================
+
+app.post(
+  "/api/orders",
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const customerBody = body.customer || {};
+      const deliveryBody = body.delivery || {};
+      const locationBody = body.location;
+
+      const customer = {
+        name: requireText(customerBody.name, "Customer name", 120),
+        contact: requireText(customerBody.contact, "Customer contact", 40),
+      };
+
+      if (customerBody.email) {
+        customer.email = requireText(customerBody.email, "Customer email", 180).toLowerCase();
+        if (!/^\S+@\S+\.\S+$/.test(customer.email)) {
+          return res.status(400).json({ success: false, message: "Customer email is invalid." });
+        }
+      }
+
+      const delivery = {
+        city: requireText(deliveryBody.city, "Delivery city", 80),
+        area: requireText(deliveryBody.area, "Delivery area", 120),
+        zone: requireText(deliveryBody.zone, "Delivery zone", 40).toLowerCase(),
+        address: requireText(deliveryBody.address, "Delivery address", 500),
+        landmark: requireText(deliveryBody.landmark, "Delivery landmark", 180),
+      };
+
+      if (!Object.prototype.hasOwnProperty.call(DELIVERY_CHARGES, delivery.zone)) {
+        return res.status(400).json({ success: false, message: "Delivery zone is invalid." });
+      }
+
+      const paymentMethod = String(body.paymentMethod || "").trim();
+      if (!["Cash on Delivery", "Online Payment"].includes(paymentMethod)) {
+        return res.status(400).json({ success: false, message: "Payment method is invalid." });
+      }
+
+      if (!Array.isArray(body.items) || body.items.length === 0 || body.items.length > 50) {
+        return res.status(400).json({ success: false, message: "Order must contain between 1 and 50 items." });
+      }
+
+      const requestedItems = body.items.map((item) => ({
+        productId: String(item.productId || item.id || "").trim().toUpperCase(),
+        quantity: Number(item.quantity),
+      }));
+
+      if (requestedItems.some((item) => !item.productId || !Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 100)) {
+        return res.status(400).json({ success: false, message: "Each order item needs a valid product ID and quantity between 1 and 100." });
+      }
+
+      const productIds = requestedItems.map((item) => item.productId);
+      if (new Set(productIds).size !== productIds.length) {
+        return res.status(400).json({ success: false, message: "Duplicate products are not allowed in an order." });
+      }
+
+      const products = await Product.find({ id: { $in: productIds }, available: true }).lean();
+      const productsById = new Map(products.map((product) => [product.id, product]));
+
+      if (products.length !== productIds.length) {
+        return res.status(400).json({ success: false, message: "One or more selected books are unavailable." });
+      }
+
+      const items = requestedItems.map(({ productId, quantity }) => {
+        const product = productsById.get(productId);
+        const unitPrice = Math.round(product.price - (product.price * product.discount) / 100);
+        return {
+          productId: product.id,
+          name: product.name,
+          quantity,
+          unitPrice,
+          lineTotal: unitPrice * quantity,
+        };
+      });
+
+      const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0);
+      const deliveryCharge = DELIVERY_CHARGES[delivery.zone];
+      const location = {};
+
+      if (locationBody && Object.keys(locationBody).length > 0) {
+        const latitude = Number(locationBody.latitude);
+        const longitude = Number(locationBody.longitude);
+        const accuracy = Number(locationBody.accuracy);
+        const capturedAt = new Date(locationBody.capturedAt);
+
+        if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+          return res.status(400).json({ success: false, message: "Location coordinates are invalid." });
+        }
+
+        location.latitude = latitude;
+        location.longitude = longitude;
+        if (Number.isFinite(accuracy) && accuracy >= 0) location.accuracy = accuracy;
+        if (!Number.isNaN(capturedAt.getTime())) location.capturedAt = capturedAt;
+      }
+
+      const order = await Order.create({
+        orderId: createOrderId(),
+        customer,
+        delivery,
+        paymentMethod,
+        items,
+        pricing: {
+          subtotal,
+          deliveryCharge,
+          total: subtotal + deliveryCharge,
+        },
+        location,
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "Order received successfully.",
+        order: {
+          orderId: order.orderId,
+          status: order.status,
+          pricing: order.pricing,
+          locationCaptured: Boolean(order.location?.latitude !== undefined),
+          createdAt: order.createdAt,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
   }
 );
 
@@ -1146,6 +1302,16 @@ app.use(
 
       });
 
+    }
+
+    if (
+      error.message.startsWith("Customer ") ||
+      error.message.startsWith("Delivery ")
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+      });
     }
 
 
