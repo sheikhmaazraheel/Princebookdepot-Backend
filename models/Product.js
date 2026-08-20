@@ -69,9 +69,17 @@ const productSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Full Cloudinary HTTPS URL
     image: {
       type: String,
-      default: null,
+      required: true,
+    },
+
+    // Cloudinary public_id used later for
+    // replacing/deleting images.
+    imagePublicId: {
+      type: String,
+      required: true,
     },
   },
   {
@@ -81,10 +89,13 @@ const productSchema = new mongoose.Schema(
 );
 
 productSchema.virtual("finalPrice").get(function () {
-  return Math.round(this.price - (this.price * this.discount) / 100);
+  return Math.round(
+    this.price - (this.price * this.discount) / 100
+  );
 });
 
-productSchema.set("toJSON", { virtuals: true });
-productSchema.set("toObject", { virtuals: true });
+productSchema.set("toJSON", {
+  virtuals: true,
+});
 
 module.exports = mongoose.model("Product", productSchema);
