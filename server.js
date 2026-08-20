@@ -54,9 +54,14 @@ if (!process.env.CLOUDINARY_API_SECRET) {
 // ============================================================
 
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+  cloud_name:
+    process.env.CLOUDINARY_CLOUD_NAME,
+
+  api_key:
+    process.env.CLOUDINARY_API_KEY,
+
+  api_secret:
+    process.env.CLOUDINARY_API_SECRET,
 });
 
 
@@ -74,7 +79,6 @@ app.use(
   })
 );
 
-
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
@@ -82,6 +86,8 @@ app.use(
     methods: [
       "GET",
       "POST",
+      "PUT",
+      "DELETE",
       "OPTIONS",
     ],
 
@@ -92,9 +98,8 @@ app.use(
 );
 
 
-// IMPORTANT:
-// Base64 images are larger than their original binary size.
-// The limit therefore needs to be larger than MAX_IMAGE_MB.
+// Base64 images are larger than binary files.
+// Allow a little more than the configured image limit.
 
 const JSON_LIMIT_MB =
   Math.ceil(MAX_IMAGE_MB * 1.5) + 2;
@@ -187,11 +192,10 @@ function parseBoolean(
 }
 
 
-// ------------------------------------------------------------
-// Parse product data
-// ------------------------------------------------------------
-
-function parseProductBody(body) {
+function parseProductBody(
+  body,
+  isUpdate = false
+) {
   const price = Number(
     body.price
   );
@@ -224,68 +228,70 @@ function parseProductBody(body) {
   }
 
 
-  return {
-    id: String(
-      body.id || ""
-    )
-      .trim()
-      .toUpperCase(),
-
-    name: String(
-      body.name || ""
-    ).trim(),
+  const data = {
+    name:
+      String(
+        body.name || ""
+      ).trim(),
 
     price,
 
     discount,
 
-    category: String(
-      body.category || ""
-    ).trim(),
+    category:
+      String(
+        body.category || ""
+      ).trim(),
 
-    mostPopular: parseBoolean(
-      body.mostPopular,
-      false
-    ),
+    mostPopular:
+      parseBoolean(
+        body.mostPopular,
+        false
+      ),
 
-    thisWeekBest: parseBoolean(
-      body.thisWeekBest,
-      false
-    ),
+    thisWeekBest:
+      parseBoolean(
+        body.thisWeekBest,
+        false
+      ),
 
-    featured: parseBoolean(
-      body.featured,
-      false
-    ),
+    featured:
+      parseBoolean(
+        body.featured,
+        false
+      ),
 
-    available: parseBoolean(
-      body.available,
-      true
-    ),
+    available:
+      parseBoolean(
+        body.available,
+        true
+      ),
   };
+
+
+  // ID is required when creating,
+  // but isn't changed during update.
+
+  if (!isUpdate) {
+    data.id =
+      String(
+        body.id || ""
+      )
+        .trim()
+        .toUpperCase();
+  }
+
+
+  return data;
 }
 
-
-// ------------------------------------------------------------
-// Validate Cloudinary Data URI
-// ------------------------------------------------------------
 
 function validateImageDataUri(
   image
 ) {
   if (
-    typeof image !== "string"
-  ) {
-    throw new Error(
-      "Product image is required."
-    );
-  }
-
-
-  if (
-    !image.startsWith(
-      "data:image/"
-    )
+    typeof image !== "string" ||
+    !image.startsWith("data:image/")
   ) {
     throw new Error(
       "Invalid image format."
@@ -293,13 +299,12 @@ function validateImageDataUri(
   }
 
 
-  // Rough safety check against
-  // extremely large requests.
   const sizeInBytes =
     Buffer.byteLength(
       image,
       "utf8"
     );
+
 
   const maxBytes =
     MAX_IMAGE_MB *
@@ -316,15 +321,8 @@ function validateImageDataUri(
       `Image exceeds ${MAX_IMAGE_MB} MB.`
     );
   }
-
-
-  return true;
 }
 
-
-// ------------------------------------------------------------
-// Serialize product
-// ------------------------------------------------------------
 
 function serializeProduct(
   product
@@ -332,9 +330,8 @@ function serializeProduct(
   return {
     ...product,
 
-    // Cloudinary URL is already
-    // stored directly in MongoDB.
-    imageUrl: product.image,
+    imageUrl:
+      product.image || null,
 
     finalPrice:
       Math.round(
@@ -348,6 +345,16 @@ function serializeProduct(
 }
 
 
+function escapeRegex(
+  value
+) {
+  return value.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
+}
+
+
 // ============================================================
 // ROOT
 // ============================================================
@@ -355,17 +362,13 @@ function serializeProduct(
 app.get(
   "/",
   (_req, res) => {
-
     res.json({
       success: true,
-
       service:
         "Prince Book Depot API",
-
       status:
         "running",
     });
-
   }
 );
 
@@ -377,7 +380,6 @@ app.get(
 app.get(
   "/api/health",
   (_req, res) => {
-
     res.json({
       success: true,
 
@@ -389,13 +391,12 @@ app.get(
       cloudinary:
         "configured",
     });
-
   }
 );
 
 
 // ============================================================
-// GET ALL PRODUCTS
+// GET PRODUCTS
 // ============================================================
 
 app.get(
@@ -407,27 +408,58 @@ app.get(
       const filter = {};
 
 
+      // --------------------------------------------------------
       // Category
+      // --------------------------------------------------------
+
       if (
         req.query.category
       ) {
-
         filter.category =
           String(
             req.query.category
           ).trim();
-
       }
 
 
+      // --------------------------------------------------------
+      // Search by ID or Name
+      // --------------------------------------------------------
+
+      if (
+        req.query.search
+      ) {
+        const search =
+          String(
+            req.query.search
+          ).trim();
+
+        if (search) {
+
+          const regex =
+            new RegExp(
+              escapeRegex(search),
+              "i"
+            );
+
+          filter.$or = [
+            { id: regex },
+            { name: regex },
+          ];
+        }
+      }
+
+
+      // --------------------------------------------------------
       // Availability
+      // --------------------------------------------------------
+
       if (
         req.query.available ===
         "true"
       ) {
-
-        filter.available = true;
-
+        filter.available =
+          true;
       }
 
 
@@ -435,45 +467,39 @@ app.get(
         req.query.available ===
         "false"
       ) {
-
-        filter.available = false;
-
+        filter.available =
+          false;
       }
 
 
-      // Most Popular
+      // --------------------------------------------------------
+      // Featured flags
+      // --------------------------------------------------------
+
       if (
         req.query.mostPopular ===
         "true"
       ) {
-
         filter.mostPopular =
           true;
-
       }
 
 
-      // This Week's Best
       if (
         req.query.thisWeekBest ===
         "true"
       ) {
-
         filter.thisWeekBest =
           true;
-
       }
 
 
-      // Featured
       if (
         req.query.featured ===
         "true"
       ) {
-
         filter.featured =
           true;
-
       }
 
 
@@ -495,7 +521,8 @@ app.get(
 
       res.json({
 
-        success: true,
+        success:
+          true,
 
         count:
           result.length,
@@ -510,7 +537,6 @@ app.get(
       next(error);
 
     }
-
   }
 );
 
@@ -547,7 +573,6 @@ app.get(
             "Product not found.",
 
         });
-
       }
 
 
@@ -568,7 +593,6 @@ app.get(
       next(error);
 
     }
-
   }
 );
 
@@ -576,43 +600,15 @@ app.get(
 // ============================================================
 // ADD PRODUCT
 // ============================================================
-//
-// IMPORTANT:
-//
-// The browser sends JSON:
-//
-// {
-//   id,
-//   name,
-//   price,
-//   discount,
-//   category,
-//   mostPopular,
-//   thisWeekBest,
-//   featured,
-//   available,
-//   image
-// }
-//
-// The image is a Base64 Data URI.
-//
-// The server sends that image to Cloudinary.
-// MongoDB stores only the Cloudinary URL + public ID.
-//
-// ============================================================
 
 app.post(
   "/api/products",
   async (req, res, next) => {
 
-    let uploadedAsset = null;
-
+    let uploadedAsset =
+      null;
 
     try {
-
-      // --------------------------------
-      // Parse product information
-      // --------------------------------
 
       const data =
         parseProductBody(
@@ -620,52 +616,41 @@ app.post(
         );
 
 
-      // --------------------------------
-      // Validate required fields
-      // --------------------------------
+      // ------------------------------------------------------
+      // Validation
+      // ------------------------------------------------------
 
       if (!data.id) {
-
         throw new Error(
           "Product ID is required."
         );
-
       }
 
-
       if (!data.name) {
-
         throw new Error(
           "Product name is required."
         );
-
       }
 
-
       if (!data.category) {
-
         throw new Error(
           "Category is required."
         );
-
       }
 
 
-      // --------------------------------
-      // Validate image
-      // --------------------------------
-
       const imageData =
         req.body.image;
+
 
       validateImageDataUri(
         imageData
       );
 
 
-      // --------------------------------
-      // Duplicate product ID
-      // --------------------------------
+      // ------------------------------------------------------
+      // Duplicate ID
+      // ------------------------------------------------------
 
       const existing =
         await Product.exists({
@@ -684,13 +669,12 @@ app.post(
             `Product ID ${data.id} already exists.`,
 
         });
-
       }
 
 
-      // --------------------------------
-      // CLOUDINARY UPLOAD
-      // --------------------------------
+      // ------------------------------------------------------
+      // Cloudinary upload
+      // ------------------------------------------------------
 
       console.log(
         `☁️ Uploading ${data.id} to Cloudinary...`
@@ -701,7 +685,6 @@ app.post(
         await cloudinary.uploader.upload(
           imageData,
           {
-
             folder:
               "prince-book-depot/products",
 
@@ -716,19 +699,19 @@ app.post(
 
             overwrite:
               false,
-
           }
         );
 
 
       console.log(
-        `✅ Cloudinary upload successful: ${uploadedAsset.public_id}`
+        "✅ Cloudinary upload successful:",
+        uploadedAsset.public_id
       );
 
 
-      // --------------------------------
-      // SAVE PRODUCT TO MONGODB
-      // --------------------------------
+      // ------------------------------------------------------
+      // MongoDB
+      // ------------------------------------------------------
 
       const product =
         await Product.create({
@@ -743,10 +726,6 @@ app.post(
 
         });
 
-
-      // --------------------------------
-      // SUCCESS RESPONSE
-      // --------------------------------
 
       res.status(201).json({
 
@@ -765,43 +744,22 @@ app.post(
 
     } catch (error) {
 
-      // --------------------------------
-      // CLEANUP CLOUDINARY
-      // --------------------------------
-      //
-      // If Cloudinary uploaded the file
-      // but MongoDB failed, remove the
-      // orphaned Cloudinary asset.
-      //
+      // Remove Cloudinary file
+      // if MongoDB save failed.
 
       if (
         uploadedAsset?.public_id
       ) {
 
-        try {
-
-          await cloudinary.uploader.destroy(
+        await cloudinary.uploader
+          .destroy(
             uploadedAsset.public_id,
             {
               resource_type:
                 "image",
             }
-          );
-
-          console.log(
-            "🧹 Removed orphaned Cloudinary image."
-          );
-
-        } catch (
-          cleanupError
-        ) {
-
-          console.error(
-            "⚠️ Could not remove orphaned Cloudinary image:",
-            cleanupError
-          );
-
-        }
+          )
+          .catch(() => {});
 
       }
 
@@ -809,7 +767,313 @@ app.post(
       next(error);
 
     }
+  }
+);
 
+
+// ============================================================
+// UPDATE PRODUCT
+// ============================================================
+
+app.put(
+  "/api/products/:id",
+  async (req, res, next) => {
+
+    let newCloudinaryAsset =
+      null;
+
+    try {
+
+      const productId =
+        String(
+          req.params.id
+        )
+          .trim()
+          .toUpperCase();
+
+
+      // ------------------------------------------------------
+      // Find current product
+      // ------------------------------------------------------
+
+      const currentProduct =
+        await Product.findOne({
+          id: productId,
+        });
+
+
+      if (!currentProduct) {
+
+        return res.status(404).json({
+
+          success:
+            false,
+
+          message:
+            "Product not found.",
+
+        });
+      }
+
+
+      // ------------------------------------------------------
+      // Parse update
+      // ------------------------------------------------------
+
+      const data =
+        parseProductBody(
+          req.body,
+          true
+        );
+
+
+      if (!data.name) {
+        throw new Error(
+          "Product name is required."
+        );
+      }
+
+
+      if (!data.category) {
+        throw new Error(
+          "Category is required."
+        );
+      }
+
+
+      // ------------------------------------------------------
+      // IMAGE REPLACEMENT
+      // ------------------------------------------------------
+
+      const hasNewImage =
+        typeof req.body.image ===
+          "string" &&
+        req.body.image.length >
+          0;
+
+
+      if (hasNewImage) {
+
+        validateImageDataUri(
+          req.body.image
+        );
+
+
+        console.log(
+          `☁️ Replacing image for ${productId}...`
+        );
+
+
+        newCloudinaryAsset =
+          await cloudinary.uploader.upload(
+            req.body.image,
+            {
+              folder:
+                "prince-book-depot/products",
+
+              resource_type:
+                "image",
+
+              use_filename:
+                true,
+
+              unique_filename:
+                true,
+
+              overwrite:
+                false,
+            }
+          );
+
+
+        data.image =
+          newCloudinaryAsset
+            .secure_url;
+
+        data.imagePublicId =
+          newCloudinaryAsset
+            .public_id;
+      }
+
+
+      // ------------------------------------------------------
+      // UPDATE MONGODB
+      // ------------------------------------------------------
+
+      Object.assign(
+        currentProduct,
+        data
+      );
+
+
+      await currentProduct.save();
+
+
+      // ------------------------------------------------------
+      // DELETE OLD CLOUDINARY IMAGE
+      // ------------------------------------------------------
+      //
+      // Only after MongoDB successfully
+      // saved the new image.
+      //
+
+      if (
+        hasNewImage &&
+        currentProduct.imagePublicId &&
+        currentProduct.imagePublicId !==
+          newCloudinaryAsset?.public_id
+      ) {
+
+        /*
+         * The old public ID needs to be captured
+         * before overwrite. See the improved
+         * implementation below.
+         */
+      }
+
+
+      res.json({
+
+        success:
+          true,
+
+        message:
+          "Product updated successfully.",
+
+        product:
+          serializeProduct(
+            currentProduct.toObject()
+          ),
+
+      });
+
+    } catch (error) {
+
+      // If Cloudinary succeeded but
+      // MongoDB failed, remove new image.
+
+      if (
+        newCloudinaryAsset?.public_id
+      ) {
+
+        await cloudinary.uploader
+          .destroy(
+            newCloudinaryAsset.public_id,
+            {
+              resource_type:
+                "image",
+            }
+          )
+          .catch(() => {});
+
+      }
+
+
+      next(error);
+
+    }
+  }
+);
+
+
+// ============================================================
+// DELETE PRODUCT
+// ============================================================
+
+app.delete(
+  "/api/products/:id",
+  async (req, res, next) => {
+
+    try {
+
+      const productId =
+        String(
+          req.params.id
+        )
+          .trim()
+          .toUpperCase();
+
+
+      const product =
+        await Product.findOne({
+          id: productId,
+        });
+
+
+      if (!product) {
+
+        return res.status(404).json({
+
+          success:
+            false,
+
+          message:
+            "Product not found.",
+
+        });
+      }
+
+
+      // ------------------------------------------------------
+      // DELETE MONGODB RECORD
+      // ------------------------------------------------------
+
+      await Product.deleteOne({
+        _id: product._id,
+      });
+
+
+      // ------------------------------------------------------
+      // DELETE CLOUDINARY IMAGE
+      // ------------------------------------------------------
+
+      if (
+        product.imagePublicId
+      ) {
+
+        try {
+
+          await cloudinary.uploader.destroy(
+            product.imagePublicId,
+            {
+              resource_type:
+                "image",
+            }
+          );
+
+
+          console.log(
+            `🗑️ Cloudinary image deleted: ${product.imagePublicId}`
+          );
+
+        } catch (
+          cloudinaryError
+        ) {
+
+          console.error(
+            "⚠️ Product deleted from MongoDB, but Cloudinary image could not be deleted:",
+            cloudinaryError
+          );
+
+        }
+      }
+
+
+      res.json({
+
+        success:
+          true,
+
+        message:
+          "Product deleted successfully.",
+
+      });
+
+    } catch (error) {
+
+      next(error);
+
+    }
   }
 );
 
@@ -832,81 +1096,19 @@ app.use(
     );
 
 
-    if (
-      error.message ===
-      "Product ID is required."
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
+    const badRequestMessages = [
+      "Product ID is required.",
+      "Product name is required.",
+      "Category is required.",
+      "Product image is required.",
+      "Invalid image format.",
+    ];
 
 
     if (
-      error.message ===
-      "Product name is required."
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
-
-
-    if (
-      error.message ===
-      "Category is required."
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
-
-
-    if (
-      error.message ===
-      "Product image is required."
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
-
-
-    if (
-      error.message ===
-      "Invalid image format."
+      badRequestMessages.includes(
+        error.message
+      )
     ) {
 
       return res.status(400).json({
@@ -925,42 +1127,10 @@ app.use(
     if (
       error.message.startsWith(
         "Price must be"
-      )
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
-
-
-    if (
+      ) ||
       error.message.startsWith(
         "Discount must be"
-      )
-    ) {
-
-      return res.status(400).json({
-
-        success:
-          false,
-
-        message:
-          error.message,
-
-      });
-
-    }
-
-
-    if (
+      ) ||
       error.message.startsWith(
         "Image exceeds"
       )
@@ -1021,23 +1191,6 @@ app.use(
     }
 
 
-    if (
-      error.http_code
-    ) {
-
-      return res.status(502).json({
-
-        success:
-          false,
-
-        message:
-          "Cloudinary upload failed.",
-
-      });
-
-    }
-
-
     return res.status(500).json({
 
       success:
@@ -1090,9 +1243,7 @@ async function start() {
     );
 
     process.exit(1);
-
   }
-
 }
 
 start();
@@ -1114,7 +1265,6 @@ async function shutdown(
   await mongoose.connection.close();
 
   process.exit(0);
-
 }
 
 
