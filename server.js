@@ -421,6 +421,44 @@ app.get(
 
 
 // ============================================================
+// LIST ORDERS
+// ============================================================
+
+app.get(
+  "/api/orders",
+  async (req, res, next) => {
+    try {
+      const filter = {};
+      const requestedStatus = String(req.query.status || "").trim().toLowerCase();
+      const validStatuses = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled"];
+
+      if (requestedStatus && validStatuses.includes(requestedStatus)) {
+        filter.status = requestedStatus;
+      }
+
+      const requestedLimit = Number(req.query.limit);
+      const limit = Number.isInteger(requestedLimit)
+        ? Math.min(Math.max(requestedLimit, 1), 200)
+        : 100;
+
+      const orders = await Order.find(filter)
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      res.json({
+        success: true,
+        count: orders.length,
+        orders,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ============================================================
 // CREATE ORDER
 // ============================================================
 
