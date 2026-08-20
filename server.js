@@ -87,6 +87,7 @@ app.use(
     methods: [
       "GET",
       "POST",
+      "PATCH",
       "PUT",
       "DELETE",
       "OPTIONS",
